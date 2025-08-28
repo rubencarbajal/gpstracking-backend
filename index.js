@@ -1,22 +1,23 @@
-// index.js  (CommonJS)
 'use strict';
 
 const net = require('net');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-require('dotenv').config(); // <-- dotenv
+require('dotenv').config();
 
-// ---- Config (env-driven) ----
-const TCP_PORT = Number(process.env.PORT || 5093);            // TK905 "watch" TCP
-const HTTP_PORT = Number(process.env.HTTP_PORT || 8080);      // REST API
+// ---- Config ----
+const TCP_PORT = Number(process.env.PORT || 5093);
+const HTTP_PORT = Number(process.env.HTTP_PORT || 8080);
 const DATA_FILE = process.env.DATA_FILE || path.join(process.cwd(), 'positions.log');
 
 const FORWARD_URL = process.env.FORWARD_URL || 'https://backend.sps-global.com.mx/api/osmand';
 const FORWARD_ENABLED = /^true|1|yes|on$/i.test(String(process.env.FORWARD_ENABLED ?? 'true'));
 const FORWARD_TIMEOUT_MS = Number(process.env.FORWARD_TIMEOUT_MS || 8000);
+const FORWARD_ONLY_VALID = /^true|1|yes|on$/i.test(String(process.env.FORWARD_ONLY_VALID ?? 'true'));
+const FORWARD_ALLOW_ZERO_COORDS = /^true|1|yes|on$/i.test(String(process.env.FORWARD_ALLOW_ZERO_COORDS ?? 'false'));
 
-// Ensure output directory exists (in case DATA_FILE points to a subfolder)
+// Ensure output folder exists
 fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
 
 // ---- In-memory last positions ----
@@ -55,18 +56,18 @@ function toIso(dmy, hms) {
 }
 
 function parseFrame(frame) {
-  const body = frame.slice(1, -1);             // remove [ ]
+  const body = frame.slice(1, -1);
   const parts = body.split('*');
   if (parts.length < 4) return null;
 
-  const vendor = parts[0];                      // e.g., SG
-  const deviceId = parts[1];                    // device IMEI/id
-  const payload = parts.slice(3).join('*');     // CMD,<csv>
+  const vendor = parts[0];
+  const deviceId = parts[1];
+  const payload = parts.slice(3).join('*');
 
   const [cmd, ...csv] = payload.split(',');
   if (csv.length < 9) return { deviceId, vendor, cmd, raw: payload }; // non-GPS event
 
-  // Expect: ddmmyy,hhmmss,valid(A/V),lat,NS,lon,EW,speedKph,course, ...
+  // ddmmyy,hhmmss,valid(A/V),lat,NS,lon,EW,speedKph,course,...
   const time = toIso(csv[0], csv[1]);
   const valid = csv[2] === 'A';
   const lat = signedCoord(csv[3], csv[4]);
@@ -83,12 +84,10 @@ function parseFrame(frame) {
   };
 }
 
-// Convert kph -> knots (OsmAnd "speed" uses knots)
 function kphToKnots(kph) {
   return kph * 0.539956803;
 }
 
-// Fire-and-forget forwarder to OsmAnd endpoint (uses global fetch on Node 18+)
 async function forwardPosition(pos) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), FORWARD_TIMEOUT_MS);
@@ -97,17 +96,13 @@ async function forwardPosition(pos) {
     params.set('id', String(pos.deviceId));
     params.set('lat', String(pos.lat));
     params.set('lon', String(pos.lon));
-    if (pos.time) params.set('timestamp', pos.time); // ISO allowed
+    if (pos.time) params.set('timestamp', pos.time); // ISO 8601
     if (typeof pos.valid === 'boolean') params.set('valid', pos.valid ? 'true' : 'false');
-    if (pos.speedKph != null) params.set('speed', kphToKnots(pos.speedKph).toFixed(2));
+    if (pos.speedKph != null) params.set('speed', kphToKnots(pos.speedKph).toFixed(2)); // knots
     if (pos.course != null) params.set('bearing', String(pos.course));
 
     const url = `${FORWARD_URL}?${params.toString()}`;
-    const r = await fetch(url, {
-      method: 'GET',
-      headers: { 'User-Agent': 'tk905-forwarder/1.0' },
-      signal: controller.signal
-    });
+    const r = await fetch(url, { method: 'GET', headers: { 'User-Agent': 'tk905-forwarder/1.0' }, signal: controller.signal });
     if (!r.ok) {
       const body = await r.text().catch(() => '');
       console.error('[FWD] HTTP', r.status, body.slice(0, 200));
@@ -119,6 +114,17 @@ async function forwardPosition(pos) {
   } finally {
     clearTimeout(t);
   }
+}
+
+function hasUsableCoords(pos) {
+  const ok =
+    Number.isFinite(pos.lat) &&
+    Number.isFinite(pos.lon) &&
+    Math.abs(pos.lat) <= 90 &&
+    Math.abs(pos.lon) <= 180;
+  if (!ok) return false;
+  if (!FORWARD_ALLOW_ZERO_COORDS && pos.lat === 0 && pos.lon === 0) return false;
+  return true;
 }
 
 // ---- TCP server ----
@@ -137,22 +143,27 @@ const server = net.createServer((socket) => {
       const pos = parseFrame(frame);
       if (!pos) continue;
 
-      if (pos.lat != null && pos.lon != null) {
+      // Always save to memory and file if it has coords (even if invalid)
+      if (hasUsableCoords(pos)) {
         lastPositions[pos.deviceId] = pos;
 
-        // Append JSON line to file (unchanged behavior)
+        // Append JSONL
         fs.appendFile(DATA_FILE, JSON.stringify(pos) + '\n', (err) => {
           if (err) console.error('File write error:', err);
         });
 
-        // Forward to OsmAnd-compatible endpoint
-        if (FORWARD_ENABLED) forwardPosition(pos);
-
-        console.log('[POS]', pos.deviceId, pos.lat, pos.lon, pos.speedKph ?? '');
+        // Forwarding policy
+        const policyAllows = !FORWARD_ONLY_VALID || pos.valid === true;
+        if (FORWARD_ENABLED && policyAllows) {
+          forwardPosition(pos); // fire-and-forget
+          console.log('[POS→FWD]', pos.deviceId, pos.lat, pos.lon, pos.valid ? 'valid' : 'invalid');
+        } else {
+          console.log('[POS→SKIP]', pos.deviceId, pos.lat, pos.lon, `valid=${pos.valid}`);
+        }
       } else {
-        // store last non-GPS event for context
+        // keep last non-GPS or unusable event for context
         lastPositions[pos.deviceId] = { ...(lastPositions[pos.deviceId] || {}), lastEvent: pos };
-        console.log('[EVT]', pos.deviceId, pos.cmd);
+        console.log('[EVT]', pos.deviceId, pos.cmd, '(no usable coords)');
       }
     }
   });
@@ -165,6 +176,7 @@ server.listen(TCP_PORT, () => {
   console.log(`[TCP] Listening on 0.0.0.0:${TCP_PORT}`);
   console.log(`[LOG] Appending JSON lines to: ${DATA_FILE}`);
   console.log(`[FWD] Forwarding: ${FORWARD_ENABLED ? 'ENABLED' : 'DISABLED'} → ${FORWARD_URL}`);
+  console.log(`[FWD] Policy: ONLY_VALID=${FORWARD_ONLY_VALID}, ALLOW_ZERO_COORDS=${FORWARD_ALLOW_ZERO_COORDS}`);
 });
 
 // ---- REST API ----
